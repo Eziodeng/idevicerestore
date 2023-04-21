@@ -72,7 +72,7 @@ static struct option longopts[] = {
 	{ "erase",          no_argument,       NULL, 'e' },
 	{ "custom",         no_argument,       NULL, 'c' },
 	{ "latest",         no_argument,       NULL, 'l' },
-	{ "cydia",          no_argument,       NULL, 's' },
+	{ "server",         required_argument, NULL, 's' },
 	{ "exclude",        no_argument,       NULL, 'x' },
 	{ "shsh",           no_argument,       NULL, 't' },
 	{ "keep-pers",      no_argument,       NULL, 'k' },
@@ -132,8 +132,8 @@ static void usage(int argc, char* argv[], int err)
 	"\n" \
 	"Advanced/experimental options:\n"
 	"  -c, --custom          Restore with a custom firmware (requires bootrom exploit)\n" \
-	"  -s, --cydia           Use Cydia's signature service instead of Apple's\n" \
-	"  -x, --exclude         Exclude nor/baseband upgrade\n" \
+	"  -s, --server URL      Override default signing server request URL\n" \
+	"  -x, --exclude         Exclude nor/baseband upgrade (legacy devices)\n" \
 	"  -t, --shsh            Fetch TSS record and save to .shsh file, then exit\n" \
 	"  -z, --no-restore      Do not restore and end after booting to the ramdisk\n" \
 	"  -k, --keep-pers       Write personalized components to files for debugging\n" \
@@ -482,17 +482,24 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (dfu_client_new(client) < 0) {
 			return -1;
 		}
-		info("exploiting with limera1n...\n");
-		// TODO: check for non-limera1n device and fail
-		if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
-			error("ERROR: limera1n exploit failed\n");
+
+		if (limera1n_is_supported(client->device)) {
+			info("exploiting with limera1n...\n");
+			if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
+				error("ERROR: limera1n exploit failed\n");
+				dfu_client_free(client);
+				return -1;
+			}
 			dfu_client_free(client);
+			info("Device should be in pwned DFU state now.\n");
+
+			return 0;
+		}
+		else {
+			dfu_client_free(client);
+			error("ERROR: This device is not supported by the limera1n exploit");
 			return -1;
 		}
-		dfu_client_free(client);
-		info("Device should be in pwned DFU state now.\n");
-
-		return 0;
 	}
 
 	if (client->flags & FLAG_LATEST) {
@@ -1229,7 +1236,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				return -1;
 			}
 			info("exploiting with limera1n\n");
-			// TODO: check for non-limera1n device and fail
 			if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
 				error("ERROR: limera1n exploit failed\n");
 				dfu_client_free(client);
@@ -1616,7 +1622,7 @@ int main(int argc, char* argv[]) {
 		client->flags |= FLAG_INTERACTIVE;
 	}
 
-	while ((opt = getopt_long(argc, argv, "dhcesxtpli:u:nC:kyPRT:zv", longopts, &optindex)) > 0) {
+	while ((opt = getopt_long(argc, argv, "dhces:xtpli:u:nC:kyPRT:zv", longopts, &optindex)) > 0) {
 		switch (opt) {
 		case 'h':
 			usage(argc, argv, 0);
@@ -1634,8 +1640,35 @@ int main(int argc, char* argv[]) {
 			client->flags |= FLAG_CUSTOM;
 			break;
 
-		case 's':
-			client->tss_url = strdup("http://cydia.saurik.com/TSS/controller?action=2");
+		case 's': {
+			if (!*optarg) {
+				error("ERROR: URL argument for --server must not be empty!\n");
+				usage(argc, argv, 1);
+				return EXIT_FAILURE;
+			}
+			char *baseurl = NULL;
+			if (!strncmp(optarg, "http://", 7) && (strlen(optarg) > 7) && (optarg[7] != '/')) {
+				baseurl = optarg+7;
+			} else if (!strncmp(optarg, "https://", 8) && (strlen(optarg) > 8) && (optarg[8] != '/')) {
+				baseurl = optarg+8;
+			}
+			if (baseurl) {
+				char *p = strchr(baseurl, '/');
+				if (!p || *(p+1) == '\0') {
+					// no path component, add default path
+					const char default_path[] = "/TSS/controller?action=2";
+					char* newurl = malloc(strlen(optarg)+sizeof(default_path));
+					sprintf(newurl, "%s%s", optarg, (p) ? default_path+1 : default_path);
+					client->tss_url = newurl;
+				} else {
+					client->tss_url = strdup(optarg);
+				}
+			} else {
+				error("ERROR: URL argument for --server is invalid, must start with http:// or https://\n");
+				usage(argc, argv, 1);
+				return EXIT_FAILURE;
+			}
+		}
 			break;
 
 		case 'x':
@@ -2274,7 +2307,7 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 	tss_parameters_add_from_manifest(parameters, build_identity, true);
 
 	/* create basic request */
-	/* Adds @BBTicket, @HostPlatformInfo, @VersionInfo, @UUID */
+	/* Adds @HostPlatformInfo, @VersionInfo, @UUID */
 	request = tss_request_new(NULL);
 	if (request == NULL) {
 		error("ERROR: Unable to create TSS request\n");
@@ -2283,7 +2316,7 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 	}
 
 	/* add common tags from manifest */
-	/* Adds Ap,OSLongVersion, AppNonce, @ApImg4Ticket */
+	/* Adds Ap,OSLongVersion, ApNonce, @ApImg4Ticket */
 	if (tss_request_add_ap_img4_tags(request, parameters) < 0) {
 		error("ERROR: Unable to add AP IMG4 tags to TSS request\n");
 		plist_free(request);
@@ -2571,9 +2604,9 @@ int personalize_component(const char *component_name, const unsigned char* compo
 	unsigned char* stitched_component = NULL;
 	unsigned int stitched_component_size = 0;
 
-	if (tss_response && tss_response_get_ap_img4_ticket(tss_response, &component_blob, &component_blob_size) == 0) {
+	if (tss_response && plist_dict_get_item(tss_response, "ApImg4Ticket")) {
 		/* stitch ApImg4Ticket into IMG4 file */
-		img4_stitch_component(component_name, component_data, component_size, component_blob, component_blob_size, &stitched_component, &stitched_component_size);
+		img4_stitch_component(component_name, component_data, component_size, tss_response, &stitched_component, &stitched_component_size);
 	} else {
 		/* try to get blob for current component from tss response */
 		if (tss_response && tss_response_get_blob_by_entry(tss_response, component_name, &component_blob) < 0) {
